@@ -1,5 +1,6 @@
 # NF-Pipeline_Aaeg
-Modular Nextflow pipeline for total RNAseq analysis; developed for research purposes.
+Modular Nextflow pipeline for total RNAseq analysis
+Developed for study of Aedes aegypti mosquitoes to investigate differentially expressed genes.
 
 Emily Dunlop, Summer 2026 Bioinformatics intern
 Lau Laboratory, BUMC 
@@ -13,6 +14,7 @@ HOW TO USE:
   - Genome FASTA
   - Transcriptome FASTA
   - GTF
+  - BED annotation
   - rRNA reference FASTA (if desired)
   - viral RNA reference FASTA (if desired)
 3) Edit nextflow.config file:
