@@ -1,0 +1,630 @@
+DE Analysis
+
+DESeq2 analysis for Aedes aegypti RNAi knockdown RNA-seq
+Runs the SAME analysis from two count sources so results are comparable:
+   1. featureCounts  -> DESeqDataSetFromMatrix
+   2. Salmon/tximport -> DESeqDataSetFromTximport (preserves length offsets)
+
+ Models fit for each source:
+   - one per tissue x sex group          (design auto-simplifies to ~ condition)
+   - all whole tissues combined          (design ~ tissue_sex + condition)
+   - cell line alone                     (design ~ condition)
+
+```{r}
+library(here)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(readr)
+library(ashr)
+library(tximport)
+```
+
+```{r}
+# need to make txi.rds again
+old_salmon_quant_dir <- "/projectnb/lau-bumc/emily/NF-Pipeline/mosquito_tissues_old_results/salmon_quant"
+
+tx2gene_file <- "/projectnb/lau-bumc/emily/NF-Pipeline/bin/tx2gene.tsv"
+tx2gene <- read_tsv(tx2gene_file, col_names = c("TXNAME", "GENEID"))
+
+# quant.sf files are staged into the work dir (current dir)
+files <- list.files(old_salmon_quant_dir, pattern = "quant.sf$", recursive = TRUE, full.names = TRUE)
+names(files) <- sub("_salmon.*", "", basename(dirname(files)))
+stopifnot(length(files) > 0, all(file.exists(files)))
+
+txi <- tximport(files,
+                type = "salmon",
+                tx2gene = tx2gene,
+                ignoreTxVersion = TRUE,
+                countsFromAbundance = "no")
+
+saveRDS(txi, here("mosq_old_txi.rds"))
+```
+
+
+```{r}
+# NOTE: FeatureCounts excluded multi-mapped reads
+
+fc_old <- "/projectnb/lau-bumc/emily/NF-Pipeline/mosquito_tissues_old_results/feature_counts/counts_matrix.txt"
+#fc_rpt <- "/projectnb/lau-bumc/emily/NF-Pipeline/mosquito_tissues_rpt_results/feature_counts/counts_matrix.txt"
+fc_cl <- "/projectnb/lau-bumc/emily/NF-Pipeline/siRNA_results/feature_counts/counts_matrix.txt"
+fc_list <- c(fc_old, fc_cl)
+
+slmn_old <- "/projectnb/lau-bumc/emily/mosq_old_txi.rds"
+#slmn_rpt <- "/projectnb/lau-bumc/emily/NF-Pipeline/mosquito_tissues_rpt_results/salmon_counts/txi.rds"
+slmn_cl <- "/projectnb/lau-bumc/emily/NF-Pipeline/siRNA_results/salmon_counts/txi.rds"
+slmn_list <- c(slmn_old, slmn_cl)
+```
+
+```{r}
+# output directory
+outdir <- here("DE_results")
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+```{r}
+# test
+sapply(fc_list, file.exists)
+sapply(slmn_list, file.exists)
+```
+
+===========================================================================
+Helpers
+===========================================================================
+
+Build the experimental design table from sample names -----------------
+Used for BOTH count sources so the two analyses share an identical design.
+
+```{r}
+build_coldata <- function(samples) {
+  cd <- data.frame(
+    row.names = samples,
+
+    condition = dplyr::case_when(
+      grepl("siGFP|WT",  samples) ~ "WT",     # note: single string, alternation INSIDE
+      grepl("AGO2|AG2",  samples) ~ "AGO2",
+      grepl("AGO1",      samples) ~ "AGO1",
+      grepl("R2D2",      samples) ~ "R2D2",
+      grepl("DCR2",      samples) ~ "DCR2",
+      grepl("DCR1",      samples) ~ "DCR1",
+      TRUE ~ NA_character_
+    ),
+
+    sex = dplyr::case_when(
+      grepl("Aag2", samples) ~ "none",        # cell line has no sex
+      grepl("_M_",  samples) ~ "M",
+      grepl("_F_",  samples) ~ "F",
+      TRUE ~ NA_character_
+    ),
+
+    tissue = dplyr::case_when(
+      grepl("Aag2",   samples) ~ "cell_line", # keyed on Aag2, NOT on condition strings
+      grepl("carc",   samples) ~ "carc",
+      grepl("head",   samples) ~ "head",
+      grepl("testes", samples) ~ "testes",
+      grepl("ovary",  samples) ~ "ovary",
+      TRUE ~ NA_character_
+    ),
+
+    # renamed from `library` to avoid shadowing base::library()
+    lib_type = ifelse(grepl("ttlRNA", samples), "ttlRNA", "LRNA"),
+
+    stringsAsFactors = FALSE
+  )
+
+  # combined tissue+sex factor: avoids rank-deficiency from the partial
+  # confound (ovary is F-only, testes is M-only) in the combined model
+  cd$tissue_sex <- paste(cd$tissue, cd$sex, sep = "_")
+
+  cd$condition  <- relevel(factor(cd$condition), ref = "WT")
+  cd$tissue     <- factor(cd$tissue)
+  cd$sex        <- factor(cd$sex)
+  cd$lib_type   <- factor(cd$lib_type)
+  cd$tissue_sex <- factor(cd$tissue_sex)
+
+  # loud failure if any sample didn't parse
+  if (any(is.na(cd$condition)) || any(is.na(cd$tissue))) {
+    warning("Some samples failed to parse:\n",
+            paste(rownames(cd)[is.na(cd$condition) | is.na(cd$tissue)], collapse = "\n"))
+  }
+  cd
+}
+```
+
+Subset a tximport object -----------------------------------------------
+THIS IS THE FIX for the Salmon bug: txi is a LIST of matrices, so it
+cannot be subset with txi[, samples]. Each component must be subset,
+and countsFromAbundance must be carried through or DESeq2 errors.
+
+```{r}
+subset_txi <- function(txi, samples) {
+  list(
+    abundance           = txi$abundance[, samples, drop = FALSE],
+    counts              = txi$counts[,    samples, drop = FALSE],
+    length              = txi$length[,    samples, drop = FALSE],
+    countsFromAbundance = txi$countsFromAbundance
+  )
+}
+```
+Drop design terms that have <2 levels in this subset --------------------
+Lets one master formula (~ tissue_sex + condition) work for every group:
+within a single tissue x sex group, tissue_sex collapses to one level and
+is silently dropped, leaving ~ condition.
+```{r}
+simplify_design <- function(coldata_sub, design_vars) {
+  keep <- design_vars[
+    vapply(design_vars,
+           function(v) nlevels(droplevels(factor(coldata_sub[[v]]))) >= 2,
+           logical(1))
+  ]
+  if (!("condition" %in% keep)) return(NULL)         # nothing to test
+  keep <- c(setdiff(keep, "condition"), "condition") # condition LAST, by convention
+  as.formula(paste("~", paste(keep, collapse = " + ")))
+}
+```
+
+Core DE runner ----------------------------------------------------------
+count_src is either a plain counts matrix (featureCounts) or a txi list
+(Salmon). Dispatches to the correct DESeq2 constructor.
+
+```{r}
+run_de <- function(sample_ids, coldata, count_src, design_vars, label) {
+
+  coldata_sub <- droplevels(coldata[sample_ids, , drop = FALSE])
+
+  # --- pre-flight: enough replication to fit a model? ---
+  rep_table <- table(coldata_sub$condition)
+
+  if (!("WT" %in% names(rep_table)) ||
+      rep_table[["WT"]] < 2 ||
+      sum(rep_table >= 2) < 2) {
+    message("  [skip] ", label, ": insufficient replication (need WT>=2 and >=2 conditions with >=2 reps)")
+    return(NULL)
+  }
+
+  # drop under-replicated conditions (n=1) so they don't break dispersion estimation
+  ok_conds <- names(rep_table)[rep_table >= 2]
+  dropped  <- setdiff(names(rep_table)[rep_table > 0], ok_conds)
+  if (length(dropped)) {
+    message("  [note] ", label, ": dropping n<2 conditions: ", paste(dropped, collapse = ", "))
+  }
+
+  coldata_sub <- droplevels(
+    coldata_sub[coldata_sub$condition %in% ok_conds, , drop = FALSE]
+  )
+  coldata_sub$condition <- relevel(factor(coldata_sub$condition), ref = "WT")
+  keep_ids <- rownames(coldata_sub)
+
+  # --- design ---
+  design_formula <- simplify_design(coldata_sub, design_vars)
+  if (is.null(design_formula)) {
+    message("  [skip] ", label, ": no usable design")
+    return(NULL)
+  }
+  message("  [run ] ", label, "  n=", length(keep_ids),
+          "  design: ", deparse(design_formula))
+
+  # --- build the DESeqDataSet from whichever source ---
+  dds <- tryCatch({
+    if (is.list(count_src) && !is.null(count_src$length)) {
+      # Salmon / tximport: subset the txi, keep the length offsets
+      txi_sub <- subset_txi(count_src, keep_ids)
+      DESeqDataSetFromTximport(txi_sub,
+                               colData = coldata_sub,
+                               design  = design_formula)
+    } else {
+      # featureCounts: plain integer matrix
+      counts_sub <- count_src[, keep_ids, drop = FALSE]
+      DESeqDataSetFromMatrix(countData = counts_sub,
+                             colData   = coldata_sub,
+                             design    = design_formula)
+    }
+  }, error = function(e) {
+    message("  [fail] ", label, " (construct): ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(dds)) return(NULL)
+
+  dds <- tryCatch(DESeq(dds), error = function(e) {
+    message("  [fail] ", label, " (DESeq): ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(dds)) return(NULL)
+
+  # --- shrunken results for every knockdown present, vs WT ---
+  conds <- setdiff(levels(coldata_sub$condition), "WT")
+
+  contrasts <- set_names(
+    map(conds, function(cond) {
+      lfcShrink(dds,
+                contrast = c("condition", cond, "WT"),
+                type     = "ashr") |>       # ashr required: apeglm can't use contrast=
+        as.data.frame() |>
+        rownames_to_column("gene_id") |>
+        arrange(padj)
+    }),
+    paste0(conds, "_vs_WT")
+  )
+
+  c(list(dds = dds), contrasts)
+}
+```
+
+```{r}
+## Export dds + one CSV per contrast --------------------------------------
+export_results <- function(res_list, group_name, source_tag) {
+  if (is.null(res_list)) return(invisible(NULL))
+
+  saveRDS(res_list$dds,
+          file.path(outdir, paste0(source_tag, "_", group_name, "_dds.rds")))
+
+  contrast_names <- setdiff(names(res_list), "dds")
+  walk(contrast_names, function(cn) {
+    write_csv(res_list[[cn]],
+              file.path(outdir, paste0(source_tag, "_", group_name, "_", cn, ".csv")))
+  })
+  invisible(NULL)
+}
+```
+
+```{r}
+## Significant genes: filtered table + one-row summary --------------------
+## Thresholds are set once here so every contrast is called the same way.
+PADJ_CUT <- 0.05
+LFC_CUT  <- 1
+
+export_sig_genes <- function(res_df, group_name, contrast, source_tag,
+                             padj_cut = PADJ_CUT, lfc_cut = LFC_CUT) {
+
+  sig <- res_df |>
+    filter(!is.na(padj), padj < padj_cut, abs(log2FoldChange) > lfc_cut) |>
+    mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) |>
+    arrange(padj)
+
+  write_csv(sig,
+            file.path(outdir,
+                      paste0(source_tag, "_", group_name, "_", contrast, "_SIGNIFICANT.csv")))
+
+  # one-row summary for the master table
+  tibble(
+    source    = source_tag,
+    group     = group_name,
+    contrast  = contrast,
+    n_tested  = sum(!is.na(res_df$padj)),          # genes that survived independent filtering
+    n_sig     = nrow(sig),
+    n_up      = sum(sig$direction == "up"),
+    n_down    = sum(sig$direction == "down"),
+    padj_cut  = padj_cut,
+    lfc_cut   = lfc_cut,
+    top_gene  = if (nrow(sig)) sig$gene_id[1] else NA_character_,
+    top_lfc   = if (nrow(sig)) round(sig$log2FoldChange[1], 3) else NA_real_
+  )
+}
+```
+
+```{r}
+## PCA plot ---------------------------------------------------------------
+plot_pca <- function(dds, label, source_tag, color_by = "condition", shape_by = NULL) {
+  vsd <- vst(dds, blind = TRUE)
+
+  intgroup <- unique(c(color_by, shape_by, "tissue_sex"))
+  intgroup <- intgroup[intgroup %in% colnames(colData(dds))]
+
+  pca_data    <- plotPCA(vsd, intgroup = intgroup, returnData = TRUE)
+  percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+  p <- ggplot(pca_data,
+              aes(x = PC1, y = PC2,
+                  color = .data[[color_by]],
+                  label = name)) +
+    geom_point(size = 3) +
+    geom_text_repel(size = 2.5, show.legend = FALSE, max.overlaps = 30) +
+    xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+    ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+    ggtitle(paste0(source_tag, " — ", label)) +
+    theme_bw()
+
+  if (!is.null(shape_by) && shape_by %in% colnames(pca_data)) {
+    p <- p + aes(shape = .data[[shape_by]])
+  }
+
+  ggsave(file.path(outdir, paste0(source_tag, "_", label, "_PCA.png")),
+         p, width = 8, height = 6, dpi = 150)
+  invisible(p)
+}
+```
+
+```{r}
+## Volcano plot -----------------------------------------------------------
+plot_volcano <- function(res_df, label, contrast, source_tag,
+                         padj_cut = PADJ_CUT, lfc_cut = LFC_CUT) {
+  df <- res_df |>
+    filter(!is.na(padj)) |>
+    mutate(sig = case_when(
+      padj < padj_cut & log2FoldChange >  lfc_cut ~ "up",
+      padj < padj_cut & log2FoldChange < -lfc_cut ~ "down",
+      TRUE ~ "ns"
+    ))
+
+  top <- df |> filter(sig != "ns") |> slice_head(n = 20)
+
+  p <- ggplot(df, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+    geom_point(alpha = 0.6, size = 1.2) +
+    geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", color = "grey60") +
+    geom_hline(yintercept = -log10(padj_cut),     linetype = "dashed", color = "grey60") +
+    geom_text_repel(data = top, aes(label = gene_id),
+                    size = 2.5, max.overlaps = 30, show.legend = FALSE) +
+    scale_color_manual(values = c(up = "firebrick", down = "steelblue", ns = "grey70")) +
+    labs(title = paste0(source_tag, " — ", label, " — ", contrast),
+         x = "log2 fold change (shrunken)", y = "-log10 adjusted p") +
+    theme_bw()
+
+  ggsave(file.path(outdir, paste0(source_tag, "_", label, "_", contrast, "_volcano.png")),
+         p, width = 7, height = 6, dpi = 150)
+  invisible(p)
+}
+
+```
+
+```{r}
+## Run every model for one count source ----------------------------------
+run_all_models <- function(count_src, coldata, source_tag) {
+
+  message("\n=== ", source_tag, " ===")
+
+  # ---- 1. tissue x sex groups (derived from the data, not hardcoded) ----
+  ts_groups <- coldata |>
+    rownames_to_column("sample") |>
+    filter(!is.na(tissue), !is.na(sex)) |>
+    mutate(grp = paste(tissue, sex, sep = "_")) |>
+    split(~ grp) |>
+    map(~ .x$sample)
+
+  # ---- 2. combined models: whole tissues pooled, cell line separate ----
+  combined_groups <- list(
+    all_tissues = rownames(coldata)[coldata$tissue != "cell_line"],
+    cell_line   = rownames(coldata)[coldata$tissue == "cell_line"]
+  )
+  combined_groups <- combined_groups[lengths(combined_groups) > 0]
+
+  all_groups <- c(ts_groups, combined_groups)
+
+  # master design; simplify_design() prunes single-level terms per group, so
+  #   - within one tissue x sex group -> ~ condition
+  #   - all_tissues                   -> ~ tissue_sex + condition
+  #   - cell_line                     -> ~ condition
+  design_vars <- c("tissue_sex", "condition")
+
+  results <- imap(all_groups, function(sample_ids, group_name) {
+    run_de(sample_ids, coldata, count_src, design_vars, group_name)
+  })
+
+  results <- compact(results)   # drop the NULLs from skipped groups
+
+  # ---- export: dds, full results, significant genes, plots ----
+  summaries <- imap(results, function(res_list, group_name) {
+
+    export_results(res_list, group_name, source_tag)
+
+    plot_pca(res_list$dds, group_name, source_tag,
+             color_by = "condition",
+             shape_by = if (group_name == "all_tissues") "tissue_sex" else NULL)
+
+    contrast_names <- setdiff(names(res_list), "dds")
+
+    map_dfr(contrast_names, function(cn) {
+      plot_volcano(res_list[[cn]], group_name, cn, source_tag)
+      export_sig_genes(res_list[[cn]], group_name, cn, source_tag)   # returns 1-row summary
+    })
+  })
+
+  summary_df <- bind_rows(summaries)
+
+  list(results = results, summary = summary_df)
+}
+
+```
+
+```{r}
+# ===========================================================================
+# 1. featureCounts
+# ===========================================================================
+fc_out_list <- list()
+fc_results_list <- list()  # collect everything here — usually easier than loose global objects
+
+
+for (i in seq_along(fc_list)) {
+
+  featureCounts_output <- fc_list[[i]]     # the current file path
+
+  fc <- read.delim(featureCounts_output,
+                    comment.char = "#",
+                    check.names  = FALSE)
+
+  fc_counts <- as.matrix(fc[, 7:ncol(fc)])
+  rownames(fc_counts) <- fc$Geneid
+  colnames(fc_counts) <- gsub("\\.dedup\\.bam$", "", basename(colnames(fc_counts)))
+
+  fc_coldata <- build_coldata(colnames(fc_counts))
+  stopifnot(identical(rownames(fc_coldata), colnames(fc_counts)))
+  
+  # give this iteration's result a unique name
+  out_name <- paste0("fc_out_", i)
+  result_name <- paste0("fc_results_", i)
+  
+  fc_out     <- run_all_models(fc_counts, fc_coldata, "featureCounts")
+  fc_results <- fc_out$results
+
+  # also store in a list, keyed by name
+  fc_out_list[[out_name]] <- fc_out
+  fc_results_list[[result_name]] <- fc_results
+}
+```
+
+```{r}
+# tests
+```
+
+```{r}
+# ===========================================================================
+# 2. Salmon / tximport
+# ===========================================================================
+salmon_out_list <- list()
+salmon_results_list <- list()
+
+for (i in seq_along(slmn_list)) {
+  
+  txi <- slmn_list[[i]]
+  txi <- readRDS(txi)
+  
+  salmon_coldata <- build_coldata(colnames(txi$counts))
+  stopifnot(identical(rownames(salmon_coldata), colnames(txi$counts)))
+  
+  salmon_out     <- run_all_models(txi, salmon_coldata, "salmon")
+  salmon_results <- salmon_out$results
+  
+  out_name <- paste0("salmon_out_", i)
+  result_name <- paste0("salmon_results_", i)
+  
+  salmon_out_list[[out_name]] <- salmon_out
+  salmon_results_list[[result_name]] <- salmon_results
+  
+}
+```
+
+```{r}
+# tests
+fc_samples     <- colnames(fc_results_list[[1]]$all_tissues$dds)
+salmon_samples <- colnames(salmon_results_list[[1]]$all_tissues$dds)
+
+setdiff(fc_samples, salmon_samples)   # sample(s) present in fc but dropped from salmon
+setdiff(salmon_samples, fc_samples)   # should be empty
+
+```
+
+
+```{r}
+# ===========================================================================
+# 3. Master summary table across both sources
+# ===========================================================================
+
+for (i in seq_along(fc_results_list)) {
+  # get fc and salmon results from results lists
+  fc_out <- fc_out_list[[i]]
+  salmon_out <- salmon_out_list[[i]]
+  
+  de_summary <- bind_rows(fc_out$summary, salmon_out$summary) |>
+    arrange(source, group, contrast)
+  
+  filename <- paste0("DE_summary_all_", i )
+  write_csv(de_summary, file.path(outdir, filename))
+  
+  message("\n--- Significant genes (padj < ", PADJ_CUT,
+          ", |log2FC| > ", LFC_CUT, ") ---")
+  print(as.data.frame(de_summary[, c("source", "group", "contrast",
+                                     "n_tested", "n_sig", "n_up", "n_down")]),
+        row.names = FALSE)
+}
+
+```
+
+```{r}
+# ===========================================================================
+# 4. Sample-name reconciliation check (needed for the two-method comparison)
+# ===========================================================================
+
+only_fc  <- setdiff(colnames(fc_counts),  colnames(txi$counts))
+only_sal <- setdiff(colnames(txi$counts), colnames(fc_counts))
+
+if (length(only_fc) || length(only_sal)) {
+  message("\n[WARN] Sample names differ between featureCounts and Salmon.")
+  if (length(only_fc))  message("  featureCounts only: ", paste(only_fc,  collapse = ", "))
+  if (length(only_sal)) message("  Salmon only:        ", paste(only_sal, collapse = ", "))
+  message("  Normalise these before comparing DEG lists across methods.")
+}
+
+message("\nDone. Outputs written to: ", outdir)
+```
+Look up significant genes
+```{r}
+# mosquito tissue genes
+salmon_results_list[[1]]
+fc_results_list[[1]]
+
+# cell line genes
+salmon_results_list[[2]]
+fc_results_list[[2]]
+```
+```{r}
+# mosquito male carcass tissues
+#salmon_results_list[[1]]$carc_M$AGO2_vs_WT
+#fc_results_list[[1]]$carc_M$AGO2_vs_WT
+
+sig1 <- salmon_results_list[[1]]$carc_M$AGO2_vs_WT |>
+  filter(!is.na(padj), padj < PADJ_CUT, abs(log2FoldChange) > LFC_CUT) |>
+  mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) |>
+  arrange(padj)
+sig1.2 <- fc_results_list[[1]]$carc_M$AGO2_vs_WT |>
+  filter(!is.na(padj), padj < PADJ_CUT, abs(log2FoldChange) > LFC_CUT) |>
+  mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) |>
+  arrange(padj)
+intersect(sig1$gene_id, sig1.2$gene_id)
+length(sig1$gene_id)
+length(sig1.2$gene_id)
+# mosquito female carcass tissues (iffy)
+#salmon_results_list[[1]]$carc_F$AGO2_vs_WT
+#fc_results_list[[1]]$carc_F$AGO2_vs_WT
+
+sig2 <- salmon_results_list[[1]]$carc_F$AGO2_vs_WT |>
+  filter(!is.na(padj), padj < PADJ_CUT, abs(log2FoldChange) > LFC_CUT) |>
+  mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) |>
+  arrange(padj)
+
+# cell line
+#salmon_results_list[[2]]$cell_line$AGO2_vs_WT
+#fc_results_list[[2]]$cell_line$AGO2_vs_WT
+
+sig3 <- salmon_results_list[[2]]$cell_line$AGO2_vs_WT |>
+  filter(!is.na(padj), padj < PADJ_CUT, abs(log2FoldChange) > LFC_CUT) |>
+  mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) |>
+  arrange(padj)
+
+sig_genes_M_F <- intersect(sig1$gene_id, sig2$gene_id)
+sig_genes_M_cl <- intersect(sig1$gene_id, sig3$gene_id)
+sig_genes_F_cl <- intersect(sig2$gene_id, sig3$gene_id)
+
+sig_all_tiss <- salmon_results_list[[1]]$all_tissues$AGO2_vs_WT |>
+  filter(!is.na(padj), padj < PADJ_CUT, abs(log2FoldChange) > LFC_CUT) |>
+  mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) |>
+  arrange(padj)
+
+intersect(sig3$gene_id, sig_all_tiss$gene_id)
+```
+
+```{r}
+# feature counts genes
+# all_tiss_ago2
+
+fc_all_tiss_ago2 <- read_csv("/projectnb/lau-bumc/emily/DE_results/results_to_use/featureCounts_genes/featureCounts_all_tissues_AGO2_vs_WT_SIGNIFICANT.csv")
+
+fc_cell_ago2 <- read_csv("/projectnb/lau-bumc/emily/DE_results/results_to_use/featureCounts_genes/featureCounts_cell_line_AGO2_vs_WT_SIGNIFICANT.csv")
+
+# salmon genes
+
+slmn_all_tiss_ago2 <- read_csv("/projectnb/lau-bumc/emily/DE_results/results_to_use/Salmon_genes/salmon_all_tissues_AGO2_vs_WT_SIGNIFICANT.csv")
+
+slmn_cell_ago2 <- read_csv("/projectnb/lau-bumc/emily/DE_results/results_to_use/Salmon_genes/salmon_cell_line_AGO2_vs_WT_SIGNIFICANT.csv")
+```
+```{r}
+# create correlation plots
+
+
+```
+
+
+
