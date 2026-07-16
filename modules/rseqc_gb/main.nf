@@ -8,8 +8,8 @@ process RSEQC_GB {
     path(ref_bed)
 
     output:
-    path("${sample_name}.geneBodyCoverage.txt"), emit: genebody
-    path("${sample_name}.geneBodyCoverage.curves.pdf"), emit: plot, optional: true
+    path("*.txt"), emit: genebody
+    path("*.pdf"), emit: plot, optional: true
 
     script:
     """
